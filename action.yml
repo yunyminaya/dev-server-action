@@ -12,6 +12,10 @@ inputs:
     description: Server configuration YAML
     required: false
     default: ""
+  version:
+    description: LiveKit server release version to install. Use latest, v1.13.3, or 1.13.3.
+    required: false
+    default: latest
 outputs:
   pid:
     description: Process ID
@@ -22,25 +26,41 @@ outputs:
 runs:
    using: composite
    steps:
+    - name: Validate macOS version
+      if: runner.os == 'macOS' && inputs.version != 'latest' && inputs.version != ''
+      shell: bash
+      run: |
+        echo "::error::The version input is not supported on macOS because LiveKit does not publish macOS release artifacts. Use version: latest or omit the input."
+        exit 1
     - name: Brew install
       if: runner.os == 'macOS'
       shell: bash
       env:
         HOMEBREW_NO_ENV_HINTS: 1
       run: brew install livekit
-    - name: Resolve latest version
+    - name: Resolve version
       if: runner.os == 'Linux' || runner.os == 'Windows'
       id: version
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github-token }}
+        LIVEKIT_VERSION: ${{ inputs.version }}
       run: |
-        tag="$(gh api repos/livekit/livekit/releases/latest --jq '.tag_name')"
+        if [ -z "$LIVEKIT_VERSION" ] || [ "$LIVEKIT_VERSION" = "latest" ]; then
+          tag="$(gh api repos/livekit/livekit/releases/latest --jq '.tag_name')"
+        else
+          tag="$LIVEKIT_VERSION"
+          case "$tag" in
+            v*) ;;
+            *) tag="v$tag" ;;
+          esac
+        fi
         if [ -z "$tag" ]; then
           echo "::error::Failed to resolve version tag"
           exit 1
         fi
-        echo "Latest version tag: $tag"
+        gh release view "$tag" --repo livekit/livekit >/dev/null
+        echo "Version tag: $tag"
         echo "tag=$tag" >> "$GITHUB_OUTPUT"
     - name: Download release artifact
       if: runner.os == 'Linux' || runner.os == 'Windows'
