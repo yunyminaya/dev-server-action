@@ -8,6 +8,12 @@ inputs:
   github-token:
     description: GitHub token
     required: true
+  version:
+    description: |
+      Optional livekit-server version to run: latest, a release tag (e.g. v1.13.3 or 1.13.3),
+      or a commit SHA from github.com/livekit/livekit are supported. Defaults to latest if unspecified.
+    required: false
+    default: latest
   config:
     description: Server configuration YAML
     required: false
@@ -22,32 +28,118 @@ outputs:
 runs:
    using: composite
    steps:
+    - name: Resolve server version
+      id: resolve
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        VERSION_INPUT: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        version="${VERSION_INPUT//[[:space:]]/}"
+
+        notify_source_build() {
+          echo "::notice title=Building livekit-server from source::$1"
+        }
+
+        if [ -z "$version" ] || [ "$version" = "latest" ]; then
+          if [ "${RUNNER_OS}" = "macOS" ]; then
+            echo "mode=brew" >> "$GITHUB_OUTPUT"
+            echo "Resolved livekit-server install mode: Homebrew (latest formula)"
+            exit 0
+          fi
+          version="$(gh api repos/livekit/livekit/releases/latest --jq '.tag_name')"
+          if [ -z "$version" ]; then
+            echo "::error::Failed to resolve latest livekit-server release tag"
+            exit 1
+          fi
+          echo "mode=release" >> "$GITHUB_OUTPUT"
+          echo "ref=$version" >> "$GITHUB_OUTPUT"
+          echo "Resolved livekit-server release: $version"
+          exit 0
+        fi
+
+        if [[ "$version" =~ ^[0-9a-fA-F]{7,40}$ ]]; then
+          notify_source_build "Commit $version requires a source build (git clone + go build). This typically takes several minutes."
+          echo "mode=source" >> "$GITHUB_OUTPUT"
+          echo "ref=$version" >> "$GITHUB_OUTPUT"
+          echo "Resolved livekit-server commit: $version"
+          exit 0
+        fi
+
+        ref="$version"
+        case "$ref" in
+          v*) ;;
+          *) ref="v$ref" ;;
+        esac
+
+        if [[ "$ref" =~ ^v[0-9] ]]; then
+          gh release view "$ref" --repo livekit/livekit >/dev/null
+          if [ "${RUNNER_OS}" = "macOS" ]; then
+            notify_source_build "macOS has no release artifacts for $ref; building from source (git clone + go build). This typically takes several minutes."
+            echo "mode=source" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=release" >> "$GITHUB_OUTPUT"
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "Resolved livekit-server release: $ref"
+          exit 0
+        fi
+
+        echo "::error::Invalid version '$version' (expected latest, release tag like v1.13.3 or 1.13.3, or commit SHA)"
+        exit 1
+
     - name: Brew install
-      if: runner.os == 'macOS'
+      if: steps.resolve.outputs.mode == 'brew'
       shell: bash
       env:
         HOMEBREW_NO_ENV_HINTS: 1
       run: brew install livekit
-    - name: Resolve latest version
-      if: runner.os == 'Linux' || runner.os == 'Windows'
-      id: version
+
+    - name: Setup Go
+      if: steps.resolve.outputs.mode == 'source'
+      uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+      with:
+        go-version: "1.26"
+        cache: false
+
+    - name: Build livekit-server from source
+      if: steps.resolve.outputs.mode == 'source'
       shell: bash
-      env:
-        GH_TOKEN: ${{ inputs.github-token }}
       run: |
-        tag="$(gh api repos/livekit/livekit/releases/latest --jq '.tag_name')"
-        if [ -z "$tag" ]; then
-          echo "::error::Failed to resolve version tag"
-          exit 1
+        set -euo pipefail
+        ref="${{ steps.resolve.outputs.ref }}"
+        src_dir="$RUNNER_TEMP/livekit-src"
+        out="$RUNNER_TEMP/livekit-server"
+        if [ "${RUNNER_OS}" = "Windows" ]; then
+          out="$RUNNER_TEMP/livekit-server.exe"
         fi
-        echo "Latest version tag: $tag"
-        echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+        git clone https://github.com/livekit/livekit.git "$src_dir"
+        pushd "$src_dir" >/dev/null
+        if [[ "$ref" =~ ^v[0-9] ]]; then
+          git fetch --depth 1 origin "refs/tags/${ref}:refs/tags/${ref}"
+          git checkout "refs/tags/${ref}"
+        else
+          git fetch --depth 1 origin "$ref"
+          git checkout "$ref"
+        fi
+
+        go build -o "$out" ./cmd/server
+        popd >/dev/null
+
+        if [ "${RUNNER_OS}" != "Windows" ]; then
+          chmod +x "$out"
+        fi
+        "$out" --version
+
     - name: Download release artifact
-      if: runner.os == 'Linux' || runner.os == 'Windows'
+      if: steps.resolve.outputs.mode == 'release'
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github-token }}
       run: |
+        set -euo pipefail
         case "${RUNNER_OS}-${RUNNER_ARCH}" in
           Linux-X64)     suffix='linux_amd64.tar.gz' ;;
           Linux-ARM64)   suffix='linux_arm64.tar.gz' ;;
@@ -57,7 +149,7 @@ runs:
         esac
         echo "::debug::Artifact suffix: $suffix"
 
-        gh release download "${{ steps.version.outputs.tag }}" \
+        gh release download "${{ steps.resolve.outputs.ref }}" \
           --repo livekit/livekit \
           --pattern "*_${suffix}" \
           --output "$RUNNER_TEMP/release-archive"
@@ -68,9 +160,10 @@ runs:
         }
 
     - name: Extract release artifact
-      if: runner.os == 'Linux' || runner.os == 'Windows'
+      if: steps.resolve.outputs.mode == 'release'
       shell: bash
       run: |
+        set -euo pipefail
         case "${RUNNER_OS}" in
           Linux) tar -xzf "$RUNNER_TEMP/release-archive" -C "$RUNNER_TEMP" && chmod +x "$RUNNER_TEMP/livekit-server" ;;
           Windows) unzip -o "$RUNNER_TEMP/release-archive" -d "$RUNNER_TEMP" ;;
@@ -99,12 +192,17 @@ runs:
       id: start
       shell: bash
       run: |
-        case "${RUNNER_OS}" in
-          macOS)   livekit_cmd="livekit-server" ;;
-          Linux)   livekit_cmd="$RUNNER_TEMP/livekit-server" ;;
-          Windows) livekit_cmd="$RUNNER_TEMP/livekit-server.exe" ;;
-          *) echo "::error::Unsupported platform: ${RUNNER_OS}"; exit 1 ;;
-        esac
+        set -euo pipefail
+        if [ -x "$RUNNER_TEMP/livekit-server" ]; then
+          livekit_cmd="$RUNNER_TEMP/livekit-server"
+        elif [ -f "$RUNNER_TEMP/livekit-server.exe" ]; then
+          livekit_cmd="$RUNNER_TEMP/livekit-server.exe"
+        elif command -v livekit-server >/dev/null 2>&1; then
+          livekit_cmd="livekit-server"
+        else
+          echo "::error::livekit-server binary not found"
+          exit 1
+        fi
 
         "$livekit_cmd" --version
 
