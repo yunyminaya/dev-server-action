@@ -94,7 +94,9 @@ runs:
       shell: bash
       env:
         HOMEBREW_NO_ENV_HINTS: 1
-      run: brew install livekit
+      run: |
+        brew update
+        brew install livekit
 
     - name: Setup Go
       if: steps.resolve.outputs.mode == 'source'
